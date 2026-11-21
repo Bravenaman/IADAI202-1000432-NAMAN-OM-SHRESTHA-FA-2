@@ -165,5 +165,7 @@ To provide logistics managers with actionable foresight, a machine learning pipe
    - Streamlit Cloud will automatically install dependencies from `requirements.txt` and launch the live web application with a public URL!
 
 ---
-
+**Live App Link:-**
+[https://share.streamlit.io/](https://iadai202-1000432-naman-om-shrestha-fa-2-nfycittgvqhmalfkaddlhj.streamlit.app/)
+---
 *Created by Naman Om Shrestha (WACP Reg No: 1000432) for Mathematics for AI-II Formative Assessment-2.*
