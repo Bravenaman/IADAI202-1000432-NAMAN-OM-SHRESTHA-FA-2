@@ -6,12 +6,14 @@ Student: Mann Paresh Patel | Registration No: 1000428 | Institution: Aspee Nutan
 
 import os
 import json
+import base64
 import pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 
 from data_processor import load_raw_data, clean_and_prepare_data, get_kpi_summary
@@ -23,12 +25,19 @@ TRAFFIC_COLORS = {
     "High": "#FB923C",
     "Jam": "#DC2626",
 }
-AGE_COLORS = {"<25": "#2563EB", "25–40": "#059669", "40+": "#D97706"}
+AGE_COLORS = {"<25": "#38BDF8", "25–40": "#34D399", "40+": "#FBBF24"}
 VEHICLE_COLORS = {
     "Bicycle": "#94A3B8",
-    "Motorcycle": "#2563EB",
-    "Scooter": "#0D9488",
-    "Van": "#7C3AED",
+    "Motorcycle": "#3B82F6",
+    "Scooter": "#2DD4BF",
+    "Van": "#8B5CF6",
+}
+VEHICLE_ORDER = ["Bicycle", "Motorcycle", "Scooter", "Van"]
+BUCKET_COLORS = {
+    "Grocery": "#3B82F6",
+    "Electronics": "#8B5CF6",
+    "Fashion": "#22D3EE",
+    "Others": "#34D399",
 }
 FEATURE_LABELS = {
     "Category_Grocery": "Grocery order",
@@ -89,8 +98,8 @@ def chip_multiselect(title, options, state_key):
         )
 
     with st.container(key=f"selectall_{state_key}"):
-        st.checkbox("Select all", key=all_key, on_change=sync_from_all)
-    with st.container(key=f"chips_{state_key}", horizontal=True, wrap=True, gap="small"):
+        st.checkbox("All", key=all_key, on_change=sync_from_all)
+    with st.container(key=f"chips_{state_key}"):
         for opt, opt_key in option_keys.items():
             st.checkbox(str(opt), key=opt_key, on_change=sync_from_options)
 
@@ -111,6 +120,120 @@ def cell_labels(value_df, count_df, formatter):
         labels.append(row)
     return labels
 
+
+pio.templates["logisight"] = go.layout.Template(
+    layout=go.Layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#D7E3F2", family="Inter, Segoe UI, sans-serif"),
+        xaxis=dict(gridcolor="#1B2E4A", zerolinecolor="#1B2E4A", color="#8FA6C3"),
+        yaxis=dict(gridcolor="#1B2E4A", zerolinecolor="#1B2E4A", color="#8FA6C3"),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#D7E3F2")),
+    )
+)
+pio.templates.default = "plotly_dark+logisight"
+
+
+def panel_head(title, subtitle, badge="", kind="bad"):
+    badge_html = f'<div class="pill {kind}">{badge}</div>' if badge else ""
+    st.markdown(
+        f"""<div class="panel-head"><div><div class="panel-title">{title}</div>
+        <div class="panel-sub">{subtitle}</div></div>{badge_html}</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def period_change(df, reducer):
+    """Percent change of the latest 14 days against the 14 days before that."""
+    if df.empty or df["Order_Date"].isna().all():
+        return None
+    end = df["Order_Date"].max()
+    recent = df[df["Order_Date"] >= end - pd.Timedelta(days=13)]
+    prior = df[
+        (df["Order_Date"] >= end - pd.Timedelta(days=27))
+        & (df["Order_Date"] < end - pd.Timedelta(days=13))
+    ]
+    if len(recent) < 50 or len(prior) < 50:
+        return None
+    current, previous = reducer(recent), reducer(prior)
+    if previous in (None, 0) or pd.isna(current) or pd.isna(previous):
+        return None
+    return (current - previous) / abs(previous) * 100
+
+
+def delta_html(pct, lower_is_better=False):
+    if pct is None or pd.isna(pct):
+        return ""
+    good = pct < 0 if lower_is_better else pct > 0
+    if abs(pct) < 0.05:
+        kind = "flat"
+    else:
+        kind = "good" if good else "bad"
+    arrow = "▼" if pct < 0 else "▲"
+    return f'<div class="kpi-delta {kind}">{arrow} {abs(pct):.1f}%</div>'
+
+
+def bottleneck_map(df):
+    routed = df.loc[valid_route_mask(df)].copy()
+    if routed.empty:
+        return None
+    points = routed.copy()
+    points["lat"] = points["Drop_Latitude"].abs()
+    points["lon"] = points["Drop_Longitude"].abs()
+    points = points[points["lat"].between(8, 36) & points["lon"].between(68, 92)]
+    if points.empty:
+        return None
+    points["lat_bin"] = points["lat"].round(1)
+    points["lon_bin"] = points["lon"].round(1)
+    aggregated = points.groupby(["lat_bin", "lon_bin"], as_index=False).agg(
+        mean_time=("Delivery_Time", "mean"),
+        orders=("Delivery_Time", "count"),
+    )
+    color_lo, color_hi = [float(v) for v in aggregated["mean_time"].quantile([0.05, 0.95])]
+    if color_hi <= color_lo:
+        color_hi = color_lo + 1
+    shared = dict(
+        lat="lat_bin",
+        lon="lon_bin",
+        color="mean_time",
+        size="orders",
+        color_continuous_scale="Turbo",
+        range_color=[color_lo, color_hi],
+        zoom=4.15,
+        center=dict(lat=21.0, lon=78.5),
+        hover_data={"orders": ":,", "mean_time": ":.0f"},
+        labels={"mean_time": "Avg min", "orders": "Orders"},
+    )
+    figure = None
+    if hasattr(px, "scatter_map"):
+        try:
+            figure = px.scatter_map(aggregated, map_style="carto-darkmatter", **shared)
+        except Exception:
+            figure = None
+    if figure is None and hasattr(px, "scatter_mapbox"):
+        try:
+            figure = px.scatter_mapbox(aggregated, mapbox_style="carto-darkmatter", **shared)
+        except Exception:
+            figure = None
+    if figure is None:
+        figure = px.scatter(
+            aggregated,
+            x="lon_bin",
+            y="lat_bin",
+            color="mean_time",
+            size="orders",
+            color_continuous_scale="Turbo",
+            range_color=[color_lo, color_hi],
+        )
+    figure.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=310,
+        paper_bgcolor="rgba(0,0,0,0)",
+        coloraxis_colorbar=dict(title="min", thickness=10),
+    )
+    return figure
+
+
 # ---------------------------------------------------------
 # Page Configuration
 # ---------------------------------------------------------
@@ -122,83 +245,121 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# Custom Styling (LogiSight Executive Dashboard Theme)
+# Command-centre theme. The academic badge at the bottom of
+# the sidebar keeps its original light card.
 # ---------------------------------------------------------
 st.markdown("""
 <style>
-    /* Main container styling */
-    .main {
-        background-color: #F8FAFC;
+    .stApp { background: #070E1C; color: #E8EEF7; }
+    [data-testid="stHeader"] { background: rgba(0,0,0,0); }
+    [data-testid="stSidebar"] {
+        background: #08111E;
+        border-right: 1px solid #17263C;
     }
-    
-    /* Header card */
-    .header-box {
-        background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 100%);
-        color: white;
-        padding: 24px 28px;
-        border-radius: 12px;
-        margin-bottom: 24px;
-        box-shadow: 0 4px 14px rgba(37, 99, 235, 0.15);
+    .block-container { padding-top: 1.1rem; max-width: 1480px; }
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] label,
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] p {
+        color: #D5E2F2 !important;
+        font-size: 13.5px;
     }
-    .header-title {
-        font-size: 26px;
-        font-weight: 700;
-        margin-bottom: 6px;
-        color: #FFFFFF !important;
+    [data-testid="stSidebar"] div[data-baseweb="checkbox"] {
+        border-radius: 4px !important;
     }
-    .header-subtitle {
-        font-size: 14px;
-        font-weight: 400;
-        color: #E0E7FF !important;
-        margin: 0;
+    [data-testid="stSidebar"] [data-testid="stCheckbox"]:has(input:checked) div[data-baseweb="checkbox"] {
+        background: #2563EB !important;
+        border-color: #2563EB !important;
     }
-    
-    /* KPI Card styling */
-    .kpi-card {
-        background: #FFFFFF;
-        border-radius: 10px;
-        padding: 18px 20px;
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-        transition: transform 0.2s ease, box-shadow 0.2s ease;
-    }
-    .kpi-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 16px rgba(0,0,0,0.08);
-    }
-    .kpi-label {
-        font-size: 13px;
-        font-weight: 600;
-        color: #64748B;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 6px;
-    }
-    .kpi-value {
-        font-size: 28px;
-        font-weight: 700;
-        color: #0F172A;
-        line-height: 1.2;
-    }
-    .kpi-sub {
+    .control-label {
+        color: #7F93AD;
         font-size: 12px;
-        color: #94A3B8;
-        margin-top: 4px;
+        font-weight: 800;
+        letter-spacing: 1.6px;
+        margin: 4px 0 14px;
     }
-    
-    /* Insight badges */
+    .filter-heading {
+        color: #8EA3BB;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 1.3px;
+        margin: 16px 0 6px;
+    }
+    .hero {
+        position: relative;
+        overflow: hidden;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 18px;
+        min-height: 158px;
+        padding: 22px 28px 18px;
+        margin-bottom: 14px;
+        border-radius: 18px;
+        border: 1px solid #1B3A60;
+        background:
+            radial-gradient(circle at 78% 18%, rgba(56,189,248,.28), transparent 26%),
+            linear-gradient(100deg, #071426 0%, #0C2344 48%, #12325C 72%, #081628 100%);
+        box-shadow: 0 16px 40px rgba(0,0,0,.28);
+    }
+    .skyline { position: absolute; right: 0; bottom: 0; width: 58%; height: 100%; opacity: .9; }
+    .hero-copy { position: relative; z-index: 1; }
+    .hero-status { position: absolute; top: 14px; right: 18px; z-index: 2; text-align: right; }
+    .hero-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .cube-logo {
+        width: 52px; height: 58px; object-fit: contain;
+        filter: drop-shadow(0 8px 16px rgba(37,99,235,.4));
+    }
+    .brand-name { color: #F8FBFF; font-weight: 800; font-size: 14px; line-height: 1.1; }
+    .brand-sub { color: #9FB4CC; font-size: 12px; }
+    .hero h1 { color: #FFFFFF !important; font-size: 34px; margin: 0; letter-spacing: -0.4px; }
+    .hero p { color: #B7C7DA; margin: 4px 0 0; font-size: 16px; }
+    .hero-status { text-align: right; }
+    .live { color: #4ADE80; font-weight: 700; font-size: 13px; }
+    .live .dot, .active-filters .dot {
+        display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+        background: #22C55E; margin-right: 6px; box-shadow: 0 0 8px #22C55E;
+    }
+    .updated { color: #8EA3BB; font-size: 12px; margin-top: 4px; }
+    .kpi-card {
+        background: linear-gradient(180deg, #10203A, #0C182C);
+        border: 1px solid #1E3558;
+        border-radius: 16px;
+        padding: 12px 14px 14px;
+        min-height: 112px;
+    }
+    .kpi-icon {
+        width: 34px; height: 34px; border-radius: 10px;
+        display: flex; align-items: center; justify-content: center; font-size: 16px;
+        background: rgba(37,99,235,.16); border: 1px solid rgba(96,165,250,.35);
+        margin-bottom: 8px;
+    }
+    .kpi-value { color: #F8FBFF; font-size: 22px; font-weight: 800; line-height: 1.15; white-space: nowrap; }
+    .kpi-label { color: #8EA3BB; font-size: 12px; margin-top: 2px; line-height: 1.3; }
+    .kpi-delta { font-size: 12px; font-weight: 700; }
+    .kpi-delta.good, .pill.good { color: #4ADE80; }
+    .kpi-delta.bad, .pill.bad { color: #F87171; }
+    .kpi-delta.flat { color: #93C5FD; }
+    [class*="st-key-card_"] {
+        background: linear-gradient(180deg, #101C33, #0C1728);
+        border: 1px solid #1E3558;
+        border-radius: 16px;
+        padding: 8px 12px 4px;
+    }
+    .panel-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 2px; }
+    .panel-title { color: #F8FBFF; font-size: 16px; font-weight: 800; }
+    .panel-sub { color: #8EA3BB; font-size: 12px; margin-top: 2px; }
+    .pill {
+        border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 800;
+        background: rgba(15,23,42,.55); border: 1px solid #243656; white-space: nowrap;
+    }
     .insight-card {
-        background-color: #F1F5F9;
-        border-left: 4px solid #2563EB;
-        padding: 12px 16px;
+        background: rgba(37,99,235,.08);
+        border-left: 3px solid #3B82F6;
+        padding: 10px 12px;
         border-radius: 0 8px 8px 0;
         font-size: 13px;
-        color: #334155;
-        margin-top: 10px;
-        margin-bottom: 15px;
+        color: #C5D4E8;
+        margin: 8px 0 14px;
     }
-    
-    /* Student info sidebar footer */
     .student-badge {
         background: #F1F5F9;
         border: 1px solid #CBD5E1;
@@ -208,43 +369,45 @@ st.markdown("""
         color: #334155;
         margin-top: 20px;
     }
-
-    .filter-heading {
-        font-size: 15px;
-        font-weight: 700;
-        color: #111827;
-        margin: 18px 0 8px;
-        padding-bottom: 8px;
-        border-bottom: 1px solid #E5E7EB;
+    .active-filters {
+        margin-top: 12px;
+        color: #D5E2F2;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: .4px;
     }
-
-    [class*="st-key-chips_"] [data-testid="stCheckbox"] {
-        width: auto !important;
+    .legend-row {
+        display: flex; align-items: center; gap: 8px;
+        color: #D5E2F2; font-size: 13px; margin: 10px 0;
+        white-space: nowrap;
     }
-    [class*="st-key-chips_"] [data-testid="stCheckbox"] label {
-        border: 1.5px solid #D1D5DB;
-        border-radius: 999px;
-        padding: 5px 12px 5px 8px;
-        background: #FFFFFF;
-        margin: 0;
-        gap: 6px;
+    .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 10px; }
+    .mins { margin-left: auto; color: #F8FBFF; font-weight: 700; }
+    .insight-row { display: flex; gap: 10px; align-items: flex-start; margin: 10px 0 12px; }
+    .insight-row strong { color: #F8FBFF; display: block; }
+    .insight-row span { color: #9FB0C6; font-size: 12.5px; }
+    [data-testid="stTabs"] [role="tablist"],
+    [data-testid="stTabs"] > div:first-child {
+        background: #0C1728;
+        border: 1px solid #1B2E4A;
+        border-radius: 12px;
+        padding: 4px;
+        gap: 4px;
     }
-    [class*="st-key-chips_"] [data-testid="stCheckbox"]:has(input:checked) label {
-        border-color: #2563EB;
-        background: #FFFFFF;
+    [data-testid="stTabs"] [data-testid="stTab"] {
+        border-radius: 8px;
+        color: #8EA3BB;
+        height: 38px;
+        padding: 0 16px !important;
+        margin: 0 3px;
+        justify-content: center;
     }
-    [class*="st-key-chips_"] [data-testid="stCheckbox"] div[data-baseweb="checkbox"] {
-        border-radius: 999px !important;
-        width: 18px;
-        height: 18px;
-        min-width: 18px;
-    }
-    [class*="st-key-chips_"] [data-testid="stCheckbox"]:has(input:checked) div[data-baseweb="checkbox"] {
+    [data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] {
         background: #2563EB !important;
-        border-color: #2563EB !important;
+        color: #FFFFFF !important;
     }
-    [class*="st-key-selectall_"] [data-testid="stCheckbox"] label {
-        font-weight: 600;
+    [data-testid="stTabs"] [data-testid="stTab"][aria-selected="true"] p {
+        color: #FFFFFF !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -285,20 +448,21 @@ ml_regressor, ml_classifier, ml_metrics = get_ml_models()
 # Sidebar: Interactive Controls & Filters
 # ---------------------------------------------------------
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2830/2830305.png", width=48)
-    st.markdown("## **LogiSight Analytics**")
-    st.caption("Delivery Decision Support System • FA-2")
-    st.divider()
+    st.markdown('<div class="control-label">CONTROL CENTRE</div>', unsafe_allow_html=True)
 
-    st.markdown("### 🎛️ Filter Parameters")
+    min_date = base_df['Order_Date'].min().date()
+    max_date = base_df['Order_Date'].max().date()
+    st.markdown('<div class="filter-heading">DATE RANGE</div>', unsafe_allow_html=True)
+    date_range = st.date_input(
+        "Order Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        help="Filter orders by recorded order placement date.",
+        label_visibility="collapsed",
+    )
 
-    # Reset Filters Button
-    if st.button("🔄 Reset All Filters", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
-
-    # Late Delivery Definition Configurator
-    with st.expander("⏱️ Late Delivery Threshold", expanded=False):
+    with st.expander("Late Delivery Threshold", expanded=False):
         threshold_mode = st.radio(
             "Threshold Calculation Mode:",
             options=["Statistical Benchmark (Mean + 1 Std)", "Custom Target SLA (Minutes)"],
@@ -311,30 +475,48 @@ with st.sidebar:
             active_threshold = default_stat_thresh
             st.info(f"Statistical Threshold: **{active_threshold:.1f} mins** (Mean: {overall_mean:.1f} + 1 Std: {overall_std:.1f})")
 
-    # Date Range Filter
-    min_date = base_df['Order_Date'].min().date()
-    max_date = base_df['Order_Date'].max().date()
-    date_range = st.date_input(
-        "📅 Order Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-        help="Filter orders by recorded order placement date."
-    )
-
     all_areas = sorted(list(base_df['Area'].dropna().unique()))
     all_vehicles = sorted(list(base_df['Vehicle'].dropna().unique()))
     all_weather = sorted(list(base_df['Weather'].dropna().unique()))
     all_traffic = sorted(list(base_df['Traffic'].dropna().unique()))
     all_categories = sorted(list(base_df['Category'].dropna().unique()))
 
-    selected_areas = chip_multiselect("📍 Geographical Area", all_areas, "area")
-    selected_vehicles = chip_multiselect("🛵 Fleet Vehicle Type", all_vehicles, "vehicle")
-    selected_weather = chip_multiselect("⛅ Weather Condition", all_weather, "weather")
-    selected_traffic = chip_multiselect("🚦 Traffic Condition", all_traffic, "traffic")
-    selected_categories = chip_multiselect("📦 Product Category", all_categories, "category")
+    selected_areas = chip_multiselect("LOCATION", all_areas, "area")
+    selected_vehicles = chip_multiselect("FLEET", all_vehicles, "vehicle")
+    st.markdown('<div class="filter-heading">CONDITIONS</div>', unsafe_allow_html=True)
+    weather_col, traffic_col = st.columns(2)
+    with weather_col:
+        selected_weather = chip_multiselect("Weather", all_weather, "weather")
+    with traffic_col:
+        selected_traffic = chip_multiselect("Traffic", all_traffic, "traffic")
+    selected_categories = chip_multiselect("PRODUCT", all_categories, "category")
 
-    st.markdown("---")
+    if st.button("↻  Reset Filters", use_container_width=True, type="primary"):
+        st.session_state.clear()
+        st.rerun()
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_d, end_d = date_range
+    else:
+        start_d, end_d = min_date, max_date
+
+    def narrowed(chosen, options):
+        return bool(chosen) and set(map(str, chosen)) != set(map(str, options))
+
+    active_filters = sum([
+        narrowed(selected_areas, all_areas),
+        narrowed(selected_vehicles, all_vehicles),
+        narrowed(selected_weather, all_weather),
+        narrowed(selected_traffic, all_traffic),
+        narrowed(selected_categories, all_categories),
+        (start_d, end_d) != (min_date, max_date),
+    ])
+    filter_word = "filter" if active_filters == 1 else "filters"
+    st.markdown(
+        f'<div class="active-filters"><span class="dot"></span>ACTIVE FILTERS<br>{active_filters} {filter_word} applied</div>',
+        unsafe_allow_html=True,
+    )
+
     # Student & Assessment Information Card (Storyboard & Rubric Alignment)
     st.markdown("""
     <div class="student-badge">
@@ -381,68 +563,93 @@ filtered_df['Delivery_Status'] = filtered_df['Is_Late'].map({1: 'Delayed (Late)'
 
 kpis = get_kpi_summary(filtered_df)
 filtered_mean = float(filtered_df["Delivery_Time"].mean()) if len(filtered_df) else float(overall_mean)
+avg_dist = float(filtered_df["Distance_KM"].mean()) if len(filtered_df) else 0.0
+latest_stamp = base_df["Order_Date"].max()
+latest_label = latest_stamp.strftime("%b %d, %Y") if pd.notna(latest_stamp) else "—"
+
+volume_delta = period_change(filtered_df, len)
+time_delta = period_change(filtered_df, lambda frame: frame["Delivery_Time"].mean())
+delay_delta = period_change(filtered_df, lambda frame: frame["Is_Late"].mean() * 100)
+rating_delta = period_change(filtered_df, lambda frame: frame["Agent_Rating"].mean())
+distance_delta = period_change(filtered_df, lambda frame: frame["Distance_KM"].mean())
 
 # ---------------------------------------------------------
-# Top Executive Header Banner
+# Command header
 # ---------------------------------------------------------
-st.markdown("""
-<div class="header-box">
-    <div class="header-title">Analyzing Last-Mile Delivery Data for Performance Insights</div>
-    <div class="header-subtitle">LogiSight Analytics Executive Decision System • Formative Assessment-2 Dashboard</div>
+with open(os.path.join(os.path.dirname(__file__), "assets", "logisight-logo.png"), "rb") as logo_file:
+    logo_uri = "data:image/png;base64," + base64.b64encode(logo_file.read()).decode("ascii")
+
+st.markdown(f"""
+<div class="hero">
+    <svg class="skyline" viewBox="0 0 640 180" preserveAspectRatio="xMaxYMax slice" aria-hidden="true">
+        <defs>
+            <linearGradient id="road" x1="0" x2="1">
+                <stop offset="0" stop-color="#0B1B33" stop-opacity="0"/>
+                <stop offset="1" stop-color="#12325C"/>
+            </linearGradient>
+            <linearGradient id="lsLogo" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#93C5FD"/>
+                <stop offset="1" stop-color="#1D4ED8"/>
+            </linearGradient>
+        </defs>
+        <polygon points="250,180 430,78 640,180" fill="#10284A"/>
+        <g fill="#16345C">
+            <rect x="300" y="96" width="16" height="84"/><rect x="322" y="70" width="22" height="110"/>
+            <rect x="350" y="108" width="14" height="72"/><rect x="370" y="58" width="26" height="122"/>
+            <rect x="402" y="88" width="18" height="92"/><rect x="426" y="46" width="20" height="134"/>
+            <rect x="452" y="100" width="28" height="80"/><rect x="486" y="64" width="16" height="116"/>
+            <rect x="508" y="112" width="22" height="68"/><rect x="536" y="78" width="18" height="102"/>
+            <rect x="560" y="40" width="24" height="140"/><rect x="590" y="90" width="16" height="90"/>
+        </g>
+        <rect x="250" y="150" width="390" height="30" fill="url(#road)"/>
+        <g transform="translate(455,92)">
+            <rect x="4" y="28" width="96" height="34" rx="5" fill="#1E40AF"/>
+            <path d="M100 36h24a7 7 0 0 1 7 7v19H100z" fill="#2563EB"/>
+            <rect x="108" y="40" width="16" height="10" rx="2" fill="#DBEAFE"/>
+            <circle cx="28" cy="64" r="8" fill="#0B1220"/>
+            <circle cx="28" cy="64" r="3.5" fill="#94A3B8"/>
+            <circle cx="108" cy="64" r="8" fill="#0B1220"/>
+            <circle cx="108" cy="64" r="3.5" fill="#94A3B8"/>
+            <image href="{logo_uri}" x="34" y="28" width="30" height="34"/>
+        </g>
+    </svg>
+    <div class="hero-copy">
+        <div class="hero-brand">
+            <img class="cube-logo" src="{logo_uri}" alt="LogiSight">
+            <div><div class="brand-name">LogiSight</div><div class="brand-sub">Analytics</div></div>
+        </div>
+        <h1>LogiSight Analytics</h1>
+        <p>Last-Mile Delivery Intelligence</p>
+    </div>
+    <div class="hero-status">
+        <div class="live"><span class="dot"></span>System Active</div>
+        <div class="updated">Last Updated: {latest_label}</div>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# Executive KPI Metric Cards (Performance Pulse)
-# ---------------------------------------------------------
+def kpi_card(icon, value, label, delta):
+    return f"""
+    <div class="kpi-card">
+        <div class="kpi-icon">{icon}</div>
+        <div class="kpi-body">
+            <div class="kpi-value-row"><div class="kpi-value">{value}</div>{delta}</div>
+            <div class="kpi-label">{label}</div>
+        </div>
+    </div>
+    """
+
 kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
-
-with kpi_col1:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Total Deliveries</div>
-        <div class="kpi-value">{kpis['total_deliveries']:,}</div>
-        <div class="kpi-sub">Filtered order volume</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi_col2:
-    delta_str = f"{kpis['avg_delivery_time'] - overall_mean:+.1f} min vs avg"
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Avg Delivery Time</div>
-        <div class="kpi-value">{kpis['avg_delivery_time']} <span style="font-size:16px;">min</span></div>
-        <div class="kpi-sub">{delta_str}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi_col3:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Delay Rate</div>
-        <div class="kpi-value">{kpis['delay_rate']}%</div>
-        <div class="kpi-sub">{kpis['delayed_count']:,} late (> {active_threshold:.0f}m)</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi_col4:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Avg Agent Rating</div>
-        <div class="kpi-value">⭐ {kpis['avg_rating']}</div>
-        <div class="kpi-sub">Workforce performance</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi_col5:
-    avg_dist = filtered_df['Distance_KM'].mean() if len(filtered_df) > 0 else 0.0
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Avg Route Distance</div>
-        <div class="kpi-value">{avg_dist:.1f} <span style="font-size:16px;">km</span></div>
-        <div class="kpi-sub">Haversine GPS distance</div>
-    </div>
-    """, unsafe_allow_html=True)
+cards = [
+    (kpi_col1, "🚚", f"{kpis['total_deliveries']:,}", "Total Deliveries", delta_html(volume_delta)),
+    (kpi_col2, "⏱️", f"{kpis['avg_delivery_time']} min", "Avg Delivery Time", delta_html(time_delta, lower_is_better=True)),
+    (kpi_col3, "⚠️", f"{kpis['delay_rate']}%", "Delay Rate", delta_html(delay_delta, lower_is_better=True)),
+    (kpi_col4, "⭐", f"{kpis['avg_rating']} / 5", "Agent Rating", delta_html(rating_delta)),
+    (kpi_col5, "📍", f"{avg_dist:.1f} km", "Avg Route Distance", delta_html(distance_delta, lower_is_better=True)),
+]
+for column, icon, value, label, delta in cards:
+    with column:
+        st.markdown(kpi_card(icon, value, label, delta), unsafe_allow_html=True)
 
 st.write("")
 
@@ -450,22 +657,234 @@ st.write("")
 # Primary Navigation Tabs
 # ---------------------------------------------------------
 tab_dash, tab_geo, tab_trends, tab_ml, tab_data, tab_docs = st.tabs([
-    "📊 Executive Dashboard (Core Visuals)",
-    "🗺️ Geospatial & Bottlenecks",
-    "📈 Operational Trends & Distributions",
-    "🤖 Predictive AI Delivery Engine",
-    "📋 Data Explorer & Preprocessing",
-    "📖 Methodology & Rubric Compliance"
+    "Overview",
+    "Bottlenecks",
+    "Trends",
+    "AI Engine",
+    "Data",
+    "Method",
 ])
 
 
 # =========================================================
 # TAB 1: EXECUTIVE DASHBOARD (COMPULSORY 5 CHARTS)
 # =========================================================
+def render_command_overview():
+    """Overview grid in the command-centre layout, using the filtered records."""
+    traffic_stats = mean_ci_table(filtered_df, ["Traffic"])
+    levels = traffic_levels(traffic_stats["Traffic"])
+    traffic_stats = traffic_stats.set_index("Traffic").reindex(levels).dropna(subset=["mean"]).reset_index()
+    traffic_means = traffic_stats.set_index("Traffic")["mean"] if not traffic_stats.empty else pd.Series(dtype=float)
+    traffic_badge = ""
+    if "Low" in traffic_means.index and "Jam" in traffic_means.index and traffic_means["Low"] > 0:
+        jam_gap = (traffic_means["Jam"] - traffic_means["Low"]) / traffic_means["Low"] * 100
+        traffic_badge = f"▲ {jam_gap:.0f}% vs Low Traffic"
+
+    veh_stats = mean_ci_table(filtered_df, ["Vehicle"])
+    veh_plot = veh_stats[veh_stats["n"] >= 50].copy()
+    if veh_plot.empty:
+        veh_plot = veh_stats.copy()
+    present = [name for name in VEHICLE_ORDER if name in set(veh_plot["Vehicle"])]
+    extras = [name for name in veh_plot["Vehicle"] if name not in present]
+    if present or extras:
+        veh_plot = veh_plot.set_index("Vehicle").loc[present + extras].reset_index()
+    fleet_badge = ""
+    if len(veh_plot) >= 2:
+        slow = veh_plot.loc[veh_plot["mean"].idxmax()]
+        fast = veh_plot.loc[veh_plot["mean"].idxmin()]
+        if slow["mean"] > 0:
+            fleet_gap = (slow["mean"] - fast["mean"]) / slow["mean"] * 100
+            fleet_badge = f"▼ {fleet_gap:.0f}% vs {slow['Vehicle']}"
+
+    row_one_left, row_one_right = st.columns(2)
+    with row_one_left:
+        with st.container(key="card_traffic", border=True):
+            panel_head("Where are we losing time?", "Average delivery time by traffic level", traffic_badge, "bad")
+            if traffic_stats.empty:
+                st.info("No traffic records in the current filter.")
+            else:
+                fig_traffic = go.Figure(go.Scatter(
+                    x=traffic_stats["Traffic"],
+                    y=traffic_stats["mean"],
+                    mode="lines+markers+text",
+                    text=[f"{value:.0f} min" for value in traffic_stats["mean"]],
+                    textposition="top center",
+                    line=dict(color="#38BDF8", width=3),
+                    marker=dict(size=10, color="#38BDF8"),
+                    cliponaxis=False,
+                    customdata=traffic_stats["n"],
+                    hovertemplate="%{x}<br>%{y:.1f} min<br>n=%{customdata:,.0f}<extra></extra>",
+                ))
+                top = float(traffic_stats["mean"].max())
+                fig_traffic.update_layout(
+                    height=300,
+                    margin=dict(l=8, r=24, t=36, b=8),
+                    showlegend=False,
+                    yaxis=dict(title="Delivery time (min)", range=[0, top * 1.35]),
+                    xaxis=dict(title="", range=[-0.4, len(traffic_stats) - 0.6]),
+                )
+                st.plotly_chart(fig_traffic, use_container_width=True)
+
+    with row_one_right:
+        with st.container(key="card_fleet", border=True):
+            panel_head("Vehicle Performance", "Average delivery time by vehicle type", fleet_badge, "good")
+            if veh_plot.empty:
+                st.info("No vehicle records in the current filter.")
+            else:
+                top = float(veh_plot["mean"].max())
+                fig_fleet = go.Figure(go.Bar(
+                    x=veh_plot["Vehicle"],
+                    y=veh_plot["mean"],
+                    marker_color=[VEHICLE_COLORS.get(name, "#3B82F6") for name in veh_plot["Vehicle"]],
+                    text=[f"{value:.0f} min" for value in veh_plot["mean"]],
+                    textposition="outside",
+                    customdata=veh_plot["n"],
+                    hovertemplate="%{x}<br>%{y:.1f} min<br>n=%{customdata:,.0f}<extra></extra>",
+                    cliponaxis=False,
+                ))
+                fig_fleet.update_layout(
+                    height=280,
+                    margin=dict(l=8, r=8, t=28, b=8),
+                    showlegend=False,
+                    yaxis=dict(title="", range=[0, top * 1.35]),
+                    xaxis=dict(title=""),
+                )
+                st.plotly_chart(fig_fleet, use_container_width=True)
+
+    rated = filtered_df[filtered_df["Agent_Rating"].between(1, 5)].copy()
+    samples = []
+    for _, group in rated.groupby("Agent_Age_Group", observed=True):
+        samples.append(group.sample(min(len(group), 280), random_state=7))
+    agent_sample = pd.concat(samples) if samples else rated
+
+    row_two_left, row_two_right = st.columns(2)
+    with row_two_left:
+        with st.container(key="card_agents", border=True):
+            panel_head("Who Performs Best?", "Agent performance by age group")
+            if agent_sample.empty:
+                st.info("No agent ratings in the current filter.")
+            else:
+                fig_people = px.scatter(
+                    agent_sample,
+                    x="Agent_Rating",
+                    y="Delivery_Time",
+                    color="Agent_Age_Group",
+                    color_discrete_map=AGE_COLORS,
+                    category_orders={"Agent_Age_Group": ["<25", "25–40", "40+"]},
+                    labels={"Agent_Rating": "Agent Rating", "Delivery_Time": "Delivery Time (min)", "Agent_Age_Group": ""},
+                    opacity=0.8,
+                )
+                fig_people.update_traces(marker=dict(size=7))
+                fig_people.update_layout(
+                    height=310,
+                    margin=dict(l=8, r=8, t=10, b=8),
+                    legend=dict(orientation="v", y=1, x=1.02),
+                    xaxis=dict(dtick=0.5, range=[2.8, 5.15]),
+                )
+                st.plotly_chart(fig_people, use_container_width=True)
+
+    with row_two_right:
+        with st.container(key="card_map", border=True):
+            panel_head("Where are the Bottlenecks?", "Drop-off cells coloured by average delivery time")
+            fig_hotspot = bottleneck_map(filtered_df)
+            if fig_hotspot is None:
+                st.info("No drop coordinates fall inside the India map window.")
+            else:
+                st.plotly_chart(fig_hotspot, use_container_width=True)
+
+    buckets = {
+        "Grocery": "Grocery",
+        "Electronics": "Electronics",
+        "Clothing": "Fashion",
+        "Apparel": "Fashion",
+        "Shoes": "Fashion",
+    }
+    grouped = filtered_df.copy()
+    grouped["Bucket"] = grouped["Category"].map(lambda name: buckets.get(name, "Others"))
+    donut_order = [name for name in ["Grocery", "Electronics", "Fashion", "Others"] if name in set(grouped["Bucket"])]
+    donut = (
+        grouped.groupby("Bucket")["Delivery_Time"]
+        .agg(mean="mean", n="count")
+        .reindex(donut_order)
+        .dropna()
+    )
+
+    area_stats = (
+        filtered_df.groupby("Area")["Delivery_Time"].agg(mean="mean", n="count").sort_values("mean", ascending=False)
+    )
+    slow_name = area_stats.index[0] if not area_stats.empty else "—"
+    slow_mean = float(area_stats.iloc[0]["mean"]) if not area_stats.empty else 0
+    if "Low" in traffic_means.index and "Jam" in traffic_means.index:
+        traffic_line = (
+            f"Jam averages {traffic_means['Jam']:.0f} min, "
+            f"{(traffic_means['Jam'] - traffic_means['Low']) / traffic_means['Low'] * 100:.0f}% longer than Low traffic."
+        )
+    else:
+        traffic_line = "Traffic comparison needs both Low and Jam in the current selection."
+    if len(veh_plot) >= 2:
+        ranked = veh_plot.sort_values("mean")
+        leader, runner = ranked.iloc[0], ranked.iloc[min(1, len(ranked) - 1)]
+        if abs(leader["mean"] - runner["mean"]) < 1:
+            fleet_line = f"{leader['Vehicle']} and {runner['Vehicle']} are tied as the fastest fleets, near {leader['mean']:.0f} min."
+        else:
+            fleet_line = f"{leader['Vehicle']} is the fastest fleet at {leader['mean']:.0f} min."
+    else:
+        fleet_line = "Not enough vehicle groups to compare."
+
+    row_three_left, row_three_right = st.columns(2)
+    with row_three_left:
+        with st.container(key="card_category", border=True):
+            panel_head("What Drives Performance?", "Delivery time by category group")
+            if donut.empty:
+                st.info("No categories in the current filter.")
+            else:
+                donut_chart, donut_legend = st.columns([1.15, 1])
+                with donut_chart:
+                    fig_donut = go.Figure(go.Pie(
+                        labels=donut.index,
+                        values=donut["n"],
+                        hole=0.72,
+                        sort=False,
+                        marker=dict(
+                            colors=[BUCKET_COLORS.get(name, "#3B82F6") for name in donut.index],
+                            line=dict(color="#0C1728", width=3),
+                        ),
+                        textinfo="none",
+                        hovertemplate="%{label}<br>%{value:,} orders<extra></extra>",
+                    ))
+                    fig_donut.add_annotation(
+                        text=f"<b>{filtered_mean:.0f} min</b><br><span style='font-size:12px'>Avg</span>",
+                        showarrow=False,
+                        font=dict(size=20, color="#F8FBFF"),
+                    )
+                    fig_donut.update_layout(height=250, margin=dict(l=4, r=4, t=4, b=4), showlegend=False)
+                    st.plotly_chart(fig_donut, use_container_width=True)
+                with donut_legend:
+                    rows = "".join(
+                        f'<div class="legend-row"><span class="swatch" style="background:{BUCKET_COLORS.get(name, "#3B82F6")}"></span>'
+                        f'{name}<span class="mins">{row["mean"]:.0f} min</span></div>'
+                        for name, row in donut.iterrows()
+                    )
+                    st.markdown(rows, unsafe_allow_html=True)
+
+    with row_three_right:
+        with st.container(key="card_insights", border=True):
+            panel_head("Key Operational Insights", "Read from the current filtered selection")
+            st.markdown(f"""
+            <div class="insight-row">🚨<div><strong>Bottleneck Detected</strong><span>{slow_name} is the slowest area at {slow_mean:.0f} min average.</span></div></div>
+            <div class="insight-row">🚦<div><strong>Traffic Impact</strong><span>{traffic_line}</span></div></div>
+            <div class="insight-row">✅<div><strong>Fleet Insight</strong><span>{fleet_line}</span></div></div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("### Detailed assignment charts")
+    st.caption("The five assessment charts stay below the command overview. Their calculations are unchanged.")
+
+
 with tab_dash:
     if len(filtered_df) == 0:
         st.warning("⚠️ No records match the active filter criteria. Please broaden your sidebar filters.")
     else:
+        render_command_overview()
         # -----------------------------------------------------
         # Visual 1 & Visual 2 (Row 1)
         # -----------------------------------------------------
@@ -514,8 +933,8 @@ with tab_dash:
                 margin=dict(l=20, r=20, t=50, b=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title_text=""),
                 height=420,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
             )
             fig_delay.add_hline(
                 y=filtered_mean,
@@ -566,8 +985,8 @@ with tab_dash:
             fig_veh.update_layout(
                 margin=dict(l=20, r=20, t=40, b=20),
                 height=420,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 showlegend=False,
                 yaxis=dict(title='Avg Delivery Time (min)', range=[0, y_top * 1.22]),
                 xaxis=dict(
@@ -655,8 +1074,8 @@ with tab_dash:
                 margin=dict(l=20, r=20, t=50, b=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title_text="Age"),
                 height=420,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 xaxis=dict(title='Agent Rating (Stars)', dtick=0.5),
                 yaxis=dict(title='Avg Delivery Time (min)'),
             )
@@ -706,8 +1125,8 @@ with tab_dash:
             fig_box.update_layout(
                 margin=dict(l=10, r=70, t=20, b=20),
                 height=max(420, 28 * len(cat_stats) + 80),
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 showlegend=False,
                 xaxis=dict(title='Median Delivery Time (min)', range=[0, float(cat_stats['median'].max()) * 1.28]),
                 yaxis=dict(
@@ -772,8 +1191,8 @@ with tab_dash:
         fig_heat.update_layout(
             margin=dict(l=30, r=30, t=20, b=20),
             height=max(320, 70 * len(area_rank) + 80),
-            plot_bgcolor='#FFFFFF',
-            paper_bgcolor='#FFFFFF',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
             xaxis=dict(title='Traffic', side='top'),
             yaxis=dict(title='', autorange='reversed'),
         )
@@ -908,8 +1327,8 @@ with tab_geo:
             fig_dist.update_layout(
                 margin=dict(l=10, r=10, t=40, b=10),
                 height=430,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                 xaxis=dict(title='Route distance (km)'),
                 yaxis=dict(title='Avg delivery time (min)'),
@@ -996,8 +1415,8 @@ with tab_trends:
             fig_trend.update_layout(
                 margin=dict(l=20, r=20, t=30, b=20),
                 height=430,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
             )
             fig_trend.update_yaxes(title_text='Avg time (min)', row=1, col=1)
@@ -1036,8 +1455,8 @@ with tab_trends:
         fig_hist.update_layout(
             margin=dict(l=20, r=20, t=50, b=20),
             height=430,
-            plot_bgcolor='#FFFFFF',
-            paper_bgcolor='#FFFFFF',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
             bargap=0.05,
         )
@@ -1105,8 +1524,8 @@ with tab_trends:
             fig_agents.update_layout(
                 margin=dict(l=20, r=20, t=20, b=20),
                 height=420,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 showlegend=False,
                 yaxis=dict(title='Agent deliveries', range=[0, float(agent_counts['Agent deliveries'].max()) * 1.18]),
             )
@@ -1159,8 +1578,8 @@ with tab_ml:
             fig_imp.update_layout(
                 margin=dict(l=10, r=60, t=20, b=20),
                 height=420,
-                plot_bgcolor='#FFFFFF',
-                paper_bgcolor='#FFFFFF',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
                 xaxis=dict(title='Share of total model importance (%)', range=[0, float(feat_df['Share'].max()) * 1.25]),
                 yaxis=dict(title=''),
             )
